@@ -480,37 +480,224 @@ async function addFree(c, it, btn) {
     btn.disabled = false; btn.textContent = 'Download MP3'; btn.onclick = () => downloadTrack(t);
   } catch { btn.disabled = false; btn.textContent = 'Couldn’t fetch it, try again'; }
 }
-function openSearch(prefill) {
-  const cid = localStorage.getItem('jamendo') || '';
-  openDlg(`<h2 style="margin-top:0">Find free music</h2>
-    <p class="sub">Type a song, artist or album name. This searches free, legally shareable music only (Internet Archive${cid ? ' and Jamendo' : ''}). Chart songs from big labels won’t appear.</p>
-    <div style="display:flex;gap:8px"><input type="text" id="sq" placeholder="Song or artist name" style="margin:0"><button class="btn sm" id="sgo">Search</button></div>
-    <label class="drop" for="sph" style="margin:12px 0 0">📷 Or search from a photo (free, read on your phone)<input id="sph" type="file" accept="image/*" hidden></label>
-    <div id="sres" style="margin-top:12px"></div><div id="sout" style="margin-top:14px"></div>
-    ${cid ? '' : `<div class="sub" style="margin-top:14px">Optional: add a free Jamendo client ID (from devportal.jamendo.com) to search Jamendo too.<div style="display:flex;gap:8px;margin-top:6px"><input type="text" id="jid" placeholder="Jamendo client ID" style="margin:0"><button class="btn sm" id="jsave">Save</button></div></div>`}`);
-  const run = async () => {
-    const q = $('#sq').value.trim(); if (!q) return;
-    const out = $('#sout'); out.innerHTML = '<p class="sub">Searching…</p>';
-    let found = [], archiveFailed = false;
-    try { found = await archiveSearch(q); } catch { archiveFailed = true; }
-    if (cid) { try { found = found.concat(await jamendoSearch(q, cid)); } catch {} }
-    if (!found.length) { out.innerHTML = `<p class="sub">${archiveFailed ? 'Couldn’t reach the search service. Check your internet connection.' : 'No free, legal MP3s found for that. Try a different spelling, or an independent artist.'}</p>`; return; }
-    out.innerHTML = found.map((c, k) => `<div class="row" style="display:block"><div class="t" style="white-space:normal">${esc(c.name)}</div><div class="a">${esc(c.artist || 'Unknown artist')} · ${esc(c.src)} · ${esc(String(c.license).replace(/^https?:\/\//, ''))}</div><button class="btn sm" data-k="${k}" style="margin-top:8px">Add to Library</button></div>`).join('');
-    out.querySelectorAll('button').forEach(b => { const c = found[+b.dataset.k]; b.onclick = () => addFree(c, { title: c.name, artist: c.artist }, b); });
-  };
-  $('#sgo').onclick = run; $('#sq').onkeydown = e => { if (e.key === 'Enter') run(); };
-  $('#sph').onchange = e => { const f = e.target.files[0]; if (f) readPhoto(f, $('#sres'), line => { $('#sq').value = line; run(); }); };
-  if (prefill) { $('#sq').value = prefill; run(); }
-  if ($('#jsave')) $('#jsave').onclick = () => { const v = $('#jid').value.trim(); if (v) { localStorage.setItem('jamendo', v); openSearch(); } };
+async function openSearch() {
+    let currentMode = 'archive'; // default
+    
+    openDlg(`
+        <h2 style="margin-top:0">Find Music</h2>
+        <div class="links" style="margin-bottom:12px">
+            <button class="small" id="mode-archive" onclick="setSearchMode('archive')">Archive</button>
+            <button class="small" id="mode-yt" onclick="setSearchMode('yt')">YouTube</button>
+            <button class="small" id="mode-sp" onclick="setSearchMode('sp')">Spotify</button>
+        </div>
+        <input type="text" id="q" placeholder="Type song name...">
+        <button class="btn sm" id="search-btn">Search</button>
+        <div id="results" style="margin-top:16px"></div>
+    `);
+
+    window.setSearchMode = (mode) => {
+        currentMode = mode;
+        $('#mode-archive').style.background = mode === 'archive' ? 'var(--accent)' : 'var(--panel2)';
+        $('#mode-yt').style.background = mode === 'yt' ? 'var(--danger)' : 'var(--panel2)';
+        $('#mode-sp').style.background = mode === 'sp' ? '#1DB954' : 'var(--panel2)';
+        $('#results').innerHTML = '';
+    };
+    
+    // Initialize first tab
+    setSearchMode('archive');
+
+    $('#search-btn').onclick = () => {
+        const q = $('#q').value.trim();
+        if (!q) return;
+        $('#results').innerHTML = '<div class="sub">Searching...</div>';
+        
+        if (currentMode === 'archive') archiveSearch(q).then(showResults);
+        else if (currentMode === 'yt') ytSearch(q).then(showResults);
+        else if (currentMode === 'sp') spSearch(q).then(showResults);
+    };
 }
 
-/* ---------- boot ---------- */
-(async () => {
-  tracks = await dbAll(); applyTheme(); render();
-  if (navigator.storage?.persist) navigator.storage.persist();
-  const link = incomingLink();
-  if (link) { document.querySelector('[data-tab=library]').click(); openConvert(link); }
-})();
+function showResults(items) {
+    const container = $('#results');
+    if (!items || items.length === 0) {
+        container.innerHTML = '<div class="empty">No results found.</div>';
+        return;
+    }
+    
+    container.innerHTML = items.map(item => `
+        <div class="row" style="cursor:pointer" onclick='convertUrl("${item.url}", "${esc(item.title)}", "${esc(item.artist || 'Unknown')}")'>
+            <div class="ico">${item.src === 'YouTube' ? '▶' : item.src === 'Spotify' ? '♫' : '📀'}</div>
+            <div class="meta">
+                <div class="t">${esc(item.name)}</div>
+                <div class="a">${esc(item.artist)} · ${item.src}</div>
+            </div>
+            <button class="small ghost" onclick="event.stopPropagation()">+</button>
+        </div>
+    `).join('');
+}
+async function ytSearch(query) {
+    try {
+        const res = await fetch(`https://pipedapi.kavin.rocks/search?q=${encodeURIComponent(query)}&filter=videos`);
+        const data = await res.json();
+        if (!data.items) return [];
+        return data.items.slice(0, 10).map(i => ({
+            name: i.title,
+            artist: i.uploaderName || '',
+            url: `https://www.youtube.com/watch?v=${i.url?.replace('/watch?v=', '')}`,
+            src: 'YouTube',
+            videoId: i.url?.replace('/watch?v=', '')
+        }));
+    } catch (e) {
+        console.error(e);
+        return [];
+    }
+}
+
+// --- SPOTIFY LOGIC ---
+async function spSearch(query) {
+    try {
+        // We search Spotify for metadata, then find the matching YouTube video for download
+        const res = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=5`);
+        const data = await res.json();
+        if (!data.tracks) return [];
+        
+        const tracks = data.tracks.items.map(t => ({
+            name: t.name,
+            artist: t.artists.map(a => a.name).join(', '),
+            src: 'Spotify'
+        }));
+        
+        // For each track, we try to find a YouTube equivalent to actually download
+        const results = await Promise.all(tracks.map(async t => {
+            const ytData = await ytSearch(`${t.name} ${t.artist}`);
+            const bestMatch = ytData[0]; // Take the top match
+            return bestMatch || { ...t, url: '#', name: t.name + ' (No YT Match)' };
+        }));
+        
+        return results;
+    } catch (e) {
+        console.error(e);
+        return [];
+    }
+}
+
+// --- CONVERSION HELPER ---
+async function convertUrl(url, title, artist) {
+    dlg.close();
+    
+    // Create a temporary job entry
+    const jobDiv = document.createElement('div');
+    jobDiv.className = 'row';
+    jobDiv.style.display = 'block';
+    jobDiv.innerHTML = `
+        <div class="t" style="font-size:14px">${esc(title)}</div>
+        <div class="prog"><i></i></div>
+        <div class="sub st">Fetching audio stream...</div>
+    `;
+    
+    // Inject into the last opened convert dialog or create a temporary one
+    // Since we might not be in openConvert(), we'll append to body temporarily or re-use a global jobs container
+    // For simplicity, let's just use the existing 'jobs' div if we are in convert, otherwise create one
+    let jobsContainer = $('#jobs');
+    if (!jobsContainer) {
+        jobsContainer = document.createElement('div');
+        jobsContainer.id = 'jobs';
+        jobsContainer.style.marginTop = '14px';
+        $('#view').appendChild(jobsContainer);
+    }
+    jobsContainer.appendChild(jobDiv);
+    
+    const bar = $('i', jobDiv);
+    const st = $('.st', jobDiv);
+    
+    try {
+        // Step 1: Get the audio stream URL from YouTube (using Piped API for direct MP3/Audio link)
+        let audioUrl = url;
+        if (url.includes('youtube.com')) {
+            st.textContent = 'Finding direct audio stream...';
+            const metaRes = await fetch(`https://pipedapi.kavin.rocks/streams/${url.split('v=')[1]}`);
+            const meta = await metaRes.json();
+            // Piped returns many streams, we pick the highest quality audio
+            const audioStreams = meta.audioStreams.sort((a, b) => b.bitrate - a.bitrate);
+            if (audioStreams.length > 0) {
+                audioUrl = audioStreams[0].url;
+            } else {
+                throw new Error('No audio stream found');
+            }
+        }
+        
+        // Step 2: Fetch the audio blob
+        st.textContent = 'Downloading audio...';
+        const response = await fetch(audioUrl);
+        const blob = await response.blob();
+        
+        // Step 3: Convert using LameJS (reuse existing logic)
+        st.textContent = 'Converting to MP3...';
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const audioBuf = await ctx.decodeAudioData(await blob.arrayBuffer());
+        ctx.close();
+        
+        const ch = Math.min(2, audioBuf.numberOfChannels);
+        const rate = audioBuf.sampleRate;
+        const kbps = 192; // Default quality
+        
+        const enc = new lamejs.Mp3Encoder(ch, rate, kbps);
+        const parts = [];
+        const step = 1152 * 20;
+        
+        const to16 = f => {
+            const o = new Int16Array(f.length);
+            for (let i = 0; i < f.length; i++) {
+                const v = Math.max(-1, Math.min(1, f[i]));
+                o[i] = v < 0 ? v * 0x8000 : v * 0x7FFF;
+            }
+            return o;
+        };
+        
+        const L = to16(audioBuf.getChannelData(0));
+        const R = ch > 1 ? to16(audioBuf.getChannelData(1)) : null;
+        
+        for (let i = 0; i < L.length; i += step) {
+            const out = ch > 1 ? enc.encodeBuffer(L.subarray(i, i + step), R.subarray(i, i + step)) : enc.encodeBuffer(L.subarray(i, i + step));
+            if (out.length) parts.push(out);
+            bar.style.width = (i / L.length * 100) + '%';
+            if ((i / step) % 10 === 0) await new Promise(r => setTimeout(r, 0));
+        }
+        const end = enc.flush();
+        if (end.length) parts.push(end);
+        
+        const mp3Blob = new Blob(parts, { type: 'audio/mpeg' });
+        
+        // Step 4: Save to Library
+        const t = { 
+            id: uid(), 
+            title: title.replace(/\.[^.]+$/, ''), 
+            artist: artist, 
+            duration: audioBuf.duration, 
+            created: Date.now(), 
+            blob: mp3Blob 
+        };
+        
+        await dbPut(t);
+        tracks.push(t);
+        
+        bar.style.width = '100%';
+        st.textContent = 'Converted!';
+        
+        const dlBtn = document.createElement('button');
+        dlBtn.className = 'small';
+        dlBtn.textContent = 'Download';
+        dlBtn.onclick = () => downloadTrack(t);
+        st.append(dlBtn);
+        
+        toast('Added to Library: ' + title);
+        
+    } catch (err) {
+        st.textContent = 'Error: ' + err.message;
+        st.style.color = 'var(--danger)';
+        console.error(err);
+    }
+}
 </script>
 </body>
 </html>
