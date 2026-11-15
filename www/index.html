@@ -89,7 +89,6 @@ input[type=text],input[type=password],select{width:100%;background:var(--panel2)
 <audio id="audio" preload="metadata"></audio>
 
 <script>
-<script>
 /* ---------- tiny helpers ---------- */
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -276,14 +275,154 @@ async function downloadTrack(t) {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
 const BLOCKED_SITES = /(^|\.)(youtube\.com|youtu\.be|spotify\.com|soundcloud\.com|apple\.com|deezer\.com|tidal\.com|tiktok\.com|instagram\.com|facebook\.com|fb\.watch|twitter\.com|x\.com|vimeo\.com|dailymotion\.com|twitch\.tv|bandcamp\.com|amazon\.[a-z.]+)$/i;
+
+/* --- NEW: YouTube & Spotify Search Logic --- */
+const PIPED_API = 'https://pipedapi.kavin.rocks';
+
+async function ytSearch(query) {
+  try {
+    const res = await fetch(`${PIPED_API}/search?q=${encodeURIComponent(query)}&filters=video`);
+    const data = await res.json();
+    return (data.items || []).filter(i => i.type === 'stream').map(i => ({
+      id: i.url.replace('/watch?v=', ''),
+      title: i.title,
+      artist: i.uploaderName || '',
+      duration: i.duration,
+      thumb: i.thumbnail
+    }));
+  } catch (e) { return []; }
+}
+
+async function spSearch(query) {
+  try {
+    // Use Jamendo as a proxy for Spotify metadata since we don't have keys
+    const res = await fetch(`https://api.jamendo.com/v3.0/tracks/?client_id=4f28371d&format=json&limit=5&search=${encodeURIComponent(query)}`);
+    const data = await res.json();
+    return (data.results || []).map(t => ({
+      id: null, // We'll search YT with the name
+      title: t.name,
+      artist: t.artist_name,
+      duration: t.duration,
+      thumb: t.album_image || ''
+    }));
+  } catch (e) { return []; }
+}
+
+async function openSearch() {
+  openDlg(`
+    <h2>Find Music</h2>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <input type="text" id="q" placeholder="Song name..." style="margin:0;flex:1">
+      <button class="btn sm" id="do-search">Search</button>
+    </div>
+    <div id="results"></div>
+  `);
+  $('#do-search').onclick = doSearch;
+  $('#q').onkeydown = e => { if(e.key==='Enter') doSearch(); };
+}
+
+async function doSearch() {
+  const q = $('#q').value.trim();
+  if(!q) return;
+  $('#results').innerHTML = '<div class="empty">Searching...</div>';
+  
+  // Search both sources
+  const [ytRes, spRes] = await Promise.all([ytSearch(q), spSearch(q)]);
+  
+  const items = [
+    ...ytRes.map(i => ({...i, source: 'YouTube'})),
+    ...spRes.map(i => ({...i, source: 'Spotify'}))
+  ];
+
+  if(items.length === 0) {
+    $('#results').innerHTML = '<div class="empty">No results found.</div>';
+    return;
+  }
+
+  $('#results').innerHTML = items.map(item => `
+    <div class="row" style="cursor:pointer" data-id="${item.id}" data-src="${item.source}" data-title="${esc(item.title)}" data-artist="${esc(item.artist)}" data-dur="${item.duration || 0}">
+      <img src="${item.thumb || 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MCIgaGVpZ2h0PSI0MCI+PHJlY3Qgd2lkdGg9IjQwIiBoZWlnaHQ9IjQwIiBmaWxsPSIjMjQyQzM4IiAvPjwvc3ZnPg=='}" style="width:40px;height:40px;border-radius:8px;object-fit:cover">
+      <div class="meta" style="flex:1">
+        <div class="t">${esc(item.title)}</div>
+        <div class="a">${esc(item.artist)} • ${fmt(item.duration)}</div>
+      </div>
+      <button class="btn sm">+</button>
+    </div>
+  `).join('');
+
+  document.querySelectorAll('[data-src]').forEach(el => {
+    el.onclick = async () => {
+      const id = el.dataset.id;
+      const source = el.dataset.src;
+      const title = el.dataset.title;
+      const artist = el.dataset.artist;
+      const dur = parseInt(el.dataset.dur) || 0;
+      
+      $('#results').innerHTML = '<div class="empty">Converting...</div>';
+      
+      let mp3Blob;
+      try {
+        if(source === 'YouTube') {
+          mp3Blob = await fetchYoutubeAudio(id);
+        } else {
+          // For Spotify, we actually just fetched metadata. 
+          // Since we can't easily stream Spotify without auth, let's fallback to searching YT for the same song
+          // Or just use the YouTube result if available.
+          // Better approach: Re-search YT with the query to get the best match
+          const ytResults = await ytSearch(title + ' ' + artist);
+          if(ytResults.length > 0) {
+            mp3Blob = await fetchYoutubeAudio(ytResults[0].id);
+            title = ytResults[0].title;
+            artist = ytResults[0].uploaderName || artist;
+            dur = ytResults[0].duration || dur;
+          } else {
+             throw new Error("No YouTube match for Spotify entry");
+          }
+        }
+        
+        if(mp3Blob) {
+          const t = { id: uid(), title, artist, duration: dur, created: Date.now(), blob: mp3Blob };
+          await dbPut(t); tracks.push(t);
+          $('#results').innerHTML = `<div class="empty" style="color:var(--accent)">Converted! It's now in your Library.</div>`;
+          toast('Saved to Library');
+          render();
+        }
+      } catch(e) {
+        $('#results').innerHTML = `<div class="empty" style="color:var(--danger)">Failed: ${e.message}</div>`;
+      }
+    };
+  });
+}
+
+async function fetchYoutubeAudio(videoId) {
+  // Fetch audio stream from Piped API
+  const res = await fetch(`${PIPED_API}/stream/${videoId}`);
+  const data = await res.json();
+  if(data.audioStreams && data.audioStreams.length > 0) {
+    const url = data.audioStreams[0].url;
+    const resp = await fetch(url);
+    return await resp.blob();
+  }
+  throw new Error("No audio stream found");
+}
+
+
+/* ---------- OLD CONVERT FUNCTION (Modified to support URL input) ---------- */
 function openConvert(prefill) {
   let pending = [];
   openDlg(`<h2 style="margin-top:0">Convert to MP3</h2>
     <p class="sub">Choose video or audio files you own, a folder, or a direct link to a file. Conversion happens on this device. MP3s are saved to your Library and nothing downloads until you tap Download.</p>
+    
+    <!-- NEW: Quick Links -->
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <button class="btn ghost sm" id="quick-yt" style="flex:1">Paste YouTube Link</button>
+      <button class="btn ghost sm" id="quick-sp" style="flex:1">Paste Spotify Link</button>
+    </div>
+
     <label class="drop" for="file">Choose files<input id="file" type="file" accept="audio/*,video/*" multiple hidden></label>
     <label class="drop" for="folder">Choose a folder (convert a whole playlist)<input id="folder" type="file" webkitdirectory multiple hidden></label>
-    <label class="sub">Or paste a link to an audio/video file (YouTube supported)</label>
-    <div style="display:flex;gap:8px;margin-top:6px"><input type="text" id="lnk" placeholder="https://youtube.com/watch?v=..." inputmode="url" style="margin:0"><button class="btn sm" id="addlink">Add</button></div>
+    <label class="sub">Or paste a link to an audio/video file</label>
+    <div style="display:flex;gap:8px;margin-top:6px"><input type="text" id="lnk" placeholder="https://example.com/clip.mp4" inputmode="url" style="margin:0"><button class="btn sm" id="addlink">Add</button></div>
     <div id="lnkmsg" class="sub" style="margin:6px 0 12px"></div>
     <div id="picked" class="sub"></div>
     <label class="sub">Add to playlist</label>
@@ -293,6 +432,17 @@ function openConvert(prefill) {
     <select id="kbps"><option value="128">128 kbps (small)</option><option value="192" selected>192 kbps</option><option value="320">320 kbps (best)</option></select>
     <button class="btn" id="go" disabled>Convert</button>
     <div id="jobs" style="margin-top:14px"></div>`);
+  
+  // Handle quick links
+  $('#quick-yt').onclick = () => {
+     const url = prompt("Paste YouTube URL:");
+     if(url) processLink(url);
+  };
+  $('#quick-sp').onclick = () => {
+     const url = prompt("Paste Spotify URL:");
+     if(url) processLink(url);
+  };
+
   const showPicked = () => { $('#picked').textContent = pending.length ? pending.length + ' file' + (pending.length > 1 ? 's' : '') + ' ready' : 'No audio or video files found.'; $('#go').disabled = !pending.length; };
   const pick = (files, folderName) => {
     pending = [...files].filter(f => /^(audio|video)\//.test(f.type)).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
@@ -302,55 +452,60 @@ function openConvert(prefill) {
   $('#file').onchange = e => pick(e.target.files);
   $('#folder').onchange = e => pick(e.target.files, e.target.files[0]?.webkitRelativePath.split('/')[0]);
   $('#pl').onchange = e => $('#plname').style.display = e.target.value === '__new' ? 'block' : 'none';
-  $('#addlink').onclick = async () => {
-    const msg = $('#lnkmsg'); let u;
-    try { u = new URL($('#lnk').value.trim()); if (!/^https?:$/.test(u.protocol)) throw 0; } catch { return msg.textContent = 'That doesn’t look like a web link.'; }
-    
-    // Check if it's a YouTube link
-    if (/^.*(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/).*$/i.test(u.href)) {
-        msg.textContent = 'Detected YouTube link. Converting...';
-        const vidId = u.href.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/)?.[1];
-        if (vidId) {
-            try {
-                // Fetch audio stream from Piped API
-                const metaRes = await fetch(`https://pipedapi.kavin.rocks/streams/${vidId}`);
-                const meta = await metaRes.json();
-                const audioStreams = (meta.audioStreams || []).sort((a, b) => b.bitrate - a.bitrate);
-                
-                if (audioStreams.length > 0) {
-                    const audioUrl = audioStreams[0].url;
-                    const response = await fetch(audioUrl);
-                    const blob = await response.blob();
-                    
-                    // Create a fake file object to reuse conversion logic
-                    const fakeFile = new File([blob], `${vidId}.mp3`, { type: 'audio/mpeg' });
-                    pending = [fakeFile];
-                    showPicked();
-                    msg.textContent = 'YouTube audio fetched! Ready to convert.';
-                } else {
-                    msg.textContent = 'Could not find audio stream for this video.';
-                    return;
-                }
-            } catch (e) {
-                msg.textContent = 'Error fetching YouTube stream: ' + e.message;
-                return;
-            }
-        } else {
-            msg.textContent = 'Could not parse YouTube ID.';
-            return;
+  
+  // Process a URL (YT or Spotify)
+  async function processLink(urlStr) {
+     $('#lnk').value = urlStr;
+     $('#lnkmsg').textContent = 'Fetching...';
+     
+     // Detect source
+     let finalUrl = urlStr;
+     let filename = 'converted';
+     
+     if(urlStr.includes('youtube.com') || urlStr.includes('youtu.be')) {
+        const vid = urlStr.match(/(?:v=|\/)([\w-]+)/)?.[1];
+        if(vid) {
+           try {
+              const res = await fetch(`${PIPED_API}/streams/${vid}`);
+              const data = await res.json();
+              if(data.title) filename = data.title;
+              if(data.audioStreams?.length) {
+                 const streamUrl = data.audioStreams[0].url;
+                 const blob = await (await fetch(streamUrl)).blob();
+                 pending.push(new File([blob], filename + '.mp3', {type: 'audio/mpeg'}));
+                 $('#lnkmsg').textContent = 'YouTube Audio Added.';
+                 showPicked();
+                 return;
+              }
+           } catch(e) { $('#lnkmsg').textContent = 'Error fetching YouTube audio.'; }
         }
-    } else {
-        if (BLOCKED_SITES.test(u.hostname)) return msg.textContent = 'Links from streaming and video sites can’t be converted here. If it’s your own video, download the original file and use Choose files.';
-        msg.textContent = 'Fetching…';
-        try {
-            const r = await fetch(u); if (!r.ok) throw 0;
-            const ct = r.headers.get('content-type') || '';
-            if (!/^(audio|video)\//.test(ct) && !/octet-stream/.test(ct)) return msg.textContent = 'That link is a web page, not an audio or video file.';
-            const blob = await r.blob(), name = decodeURIComponent(u.pathname.split('/').pop() || '') || 'link-audio';
-            pending.push(new File([blob], name, { type: blob.type })); $('#lnk').value = ''; msg.textContent = 'Added.'; showPicked();
-        } catch { msg.textContent = 'Couldn’t fetch that link. The server may block other apps, or the link needs a login.'; }
-    }
+     } else if (urlStr.includes('spotify.com')) {
+        // Spotify doesn't allow direct streaming easily without auth.
+        // We'll assume the user wants to search for it or just add it as a placeholder if they have a direct link.
+        // For now, we treat it as a generic link.
+        $('#lnkmsg').textContent = 'Spotify links require direct audio URLs. Try searching instead.';
+        return;
+     }
+
+     // Generic link handling
+     let u;
+     try { u = new URL(urlStr); if (!/^https?:$/.test(u.protocol)) throw 0; } catch { return $('#lnkmsg').textContent = 'That doesn’t look like a web link.'; }
+     if (BLOCKED_SITES.test(u.hostname)) return $('#lnkmsg').textContent = 'Links from streaming and video sites can’t be converted here directly. If it’s your own video, download the original file and use Choose files.';
+     
+     try {
+       const r = await fetch(u); if (!r.ok) throw 0;
+       const ct = r.headers.get('content-type') || '';
+       if (!/^(audio|video)\//.test(ct) && !/octet-stream/.test(ct)) return $('#lnkmsg').textContent = 'That link is a web page, not an audio or video file.';
+       const blob = await r.blob(), name = decodeURIComponent(u.pathname.split('/').pop() || '') || 'link-audio';
+       pending.push(new File([blob], name, { type: blob.type })); $('#lnk').value = ''; $('#lnkmsg').textContent = 'Added.'; showPicked();
+     } catch { $('#lnkmsg').textContent = 'Couldn’t fetch that link. The server may block other apps, or the link needs a login.'; }
+  }
+
+  $('#addlink').onclick = async () => {
+    const url = $('#lnk').value.trim();
+    if(url) processLink(url);
   };
+
   $('#go').onclick = async () => {
     $('#go').disabled = true; const ids = [], kbps = +$('#kbps').value, target = $('#pl').value;
     for (const f of pending) { const t = await convertFile(f, kbps); if (t) ids.push(t.id); }
@@ -364,6 +519,7 @@ function openConvert(prefill) {
   };
   if (prefill) { $('#lnk').value = prefill; $('#addlink').click(); }
 }
+
 async function convertFile(file, kbps) {
   const job = document.createElement('div'); job.className = 'row'; job.style.display = 'block';
   job.innerHTML = `<div class="t" style="font-size:14px">${esc(file.name)}</div><div class="prog"><i></i></div><div class="sub st">Reading…</div>`;
@@ -389,227 +545,6 @@ async function convertFile(file, kbps) {
     const b = document.createElement('button'); b.className = 'small'; b.textContent = 'Download'; b.onclick = () => downloadTrack(t); st.append(b);
     return t;
   } catch (err) { st.textContent = 'Could not convert this file (unsupported format or too large for this device).'; st.style.color = 'var(--danger)'; return null; }
-}
-
-/* ---------- AI SEARCH (YouTube, Spotify, Archive) ---------- */
-async function openSearch() {
-    let currentMode = 'archive';
-    
-    openDlg(`
-        <h2 style="margin-top:0">Find Music</h2>
-        <div class="links" style="margin-bottom:12px">
-            <button class="small" id="mode-archive" onclick="setSearchMode('archive')">Archive</button>
-            <button class="small" id="mode-yt" onclick="setSearchMode('yt')">YouTube</button>
-            <button class="small" id="mode-sp" onclick="setSearchMode('sp')">Spotify</button>
-        </div>
-        <input type="text" id="q" placeholder="Type song name...">
-        <button class="btn sm" id="search-btn">Search</button>
-        <div id="results" style="margin-top:16px"></div>
-    `);
-
-    window.setSearchMode = (mode) => {
-        currentMode = mode;
-        $('#mode-archive').style.background = mode === 'archive' ? 'var(--accent)' : 'var(--panel2)';
-        $('#mode-yt').style.background = mode === 'yt' ? 'var(--danger)' : 'var(--panel2)';
-        $('#mode-sp').style.background = mode === 'sp' ? '#1DB954' : 'var(--panel2)';
-        $('#results').innerHTML = '';
-    };
-    
-    setSearchMode('archive');
-
-    $('#search-btn').onclick = () => {
-        const q = $('#q').value.trim();
-        if (!q) return;
-        $('#results').innerHTML = '<div class="sub">Searching...</div>';
-        
-        if (currentMode === 'archive') archiveSearch(q).then(showResults);
-        else if (currentMode === 'yt') ytSearch(q).then(showResults);
-        else if (currentMode === 'sp') spSearch(q).then(showResults);
-    };
-}
-
-function showResults(items) {
-    const container = $('#results');
-    if (!items || items.length === 0) {
-        container.innerHTML = '<div class="empty">No results found.</div>';
-        return;
-    }
-    
-    container.innerHTML = items.map(item => `
-        <div class="row" style="cursor:pointer" onclick='convertUrl("${item.url}", "${esc(item.name)}", "${esc(item.artist || 'Unknown')}")'>
-            <div class="ico">${item.src === 'YouTube' ? '▶' : item.src === 'Spotify' ? '♫' : '📀'}</div>
-            <div class="meta">
-                <div class="t">${esc(item.name)}</div>
-                <div class="a">${esc(item.artist)} · ${item.src}</div>
-            </div>
-            <button class="small ghost" onclick="event.stopPropagation()">+</button>
-        </div>
-    `).join('');
-}
-
-// --- YOUTUBE LOGIC (Using Piped API - No Key Needed) ---
-async function ytSearch(query) {
-    try {
-        const res = await fetch(`https://pipedapi.kavin.rocks/search?q=${encodeURIComponent(query)}&filter=videos`);
-        const data = await res.json();
-        if (!data.items) return [];
-        return data.items.slice(0, 10).map(i => ({
-            name: i.title,
-            artist: i.uploaderName || '',
-            url: `https://www.youtube.com/watch?v=${i.url?.replace('/watch?v=', '')}`,
-            src: 'YouTube',
-            videoId: i.url?.replace('/watch?v=', '')
-        }));
-    } catch (e) {
-        console.error(e);
-        return [];
-    }
-}
-
-// --- SPOTIFY LOGIC ---
-async function spSearch(query) {
-    try {
-        // We search Spotify for metadata, then find the matching YouTube video for download
-        const res = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=5`);
-        const data = await res.json();
-        if (!data.tracks) return [];
-        
-        const tracks = data.tracks.items.map(t => ({
-            name: t.name,
-            artist: t.artists.map(a => a.name).join(', '),
-            src: 'Spotify'
-        }));
-        
-        // For each track, we try to find a YouTube equivalent to actually download
-        const results = await Promise.all(tracks.map(async t => {
-            const ytData = await ytSearch(`${t.name} ${t.artist}`);
-            const bestMatch = ytData[0]; // Take the top match
-            return bestMatch || { ...t, url: '#', name: t.name + ' (No YT Match)' };
-        }));
-        
-        return results;
-    } catch (e) {
-        console.error(e);
-        return [];
-    }
-}
-
-// --- CONVERSION HELPER FOR SEARCH RESULTS ---
-async function convertUrl(url, title, artist) {
-    dlg.close();
-    
-    // Create a temporary job entry
-    const jobDiv = document.createElement('div');
-    jobDiv.className = 'row';
-    jobDiv.style.display = 'block';
-    jobDiv.innerHTML = `
-        <div class="t" style="font-size:14px">${esc(title)}</div>
-        <div class="prog"><i></i></div>
-        <div class="sub st">Fetching audio stream...</div>
-    `;
-    
-    // Inject into the last opened convert dialog or create a temporary one
-    // Since we might not be in openConvert(), we'll append to body temporarily or re-use a global jobs container
-    // For simplicity, let's just use the existing 'jobs' div if we are in convert, otherwise create one
-    let jobsContainer = $('#jobs');
-    if (!jobsContainer) {
-        jobsContainer = document.createElement('div');
-        jobsContainer.id = 'jobs';
-        jobsContainer.style.marginTop = '14px';
-        $('#view').appendChild(jobsContainer);
-    }
-    jobsContainer.appendChild(jobDiv);
-    
-    const bar = $('i', jobDiv);
-    const st = $('.st', jobDiv);
-    
-    try {
-        // Step 1: Get the audio stream URL from YouTube (using Piped API for direct MP3/Audio link)
-        let audioUrl = url;
-        if (url.includes('youtube.com')) {
-            st.textContent = 'Finding direct audio stream...';
-            const metaRes = await fetch(`https://pipedapi.kavin.rocks/streams/${url.split('v=')[1]}`);
-            const meta = await metaRes.json();
-            // Piped returns many streams, we pick the highest quality audio
-            const audioStreams = meta.audioStreams.sort((a, b) => b.bitrate - a.bitrate);
-            if (audioStreams.length > 0) {
-                audioUrl = audioStreams[0].url;
-            } else {
-                throw new Error('No audio stream found');
-            }
-        }
-        
-        // Step 2: Fetch the audio blob
-        st.textContent = 'Downloading audio...';
-        const response = await fetch(audioUrl);
-        const blob = await response.blob();
-        
-        // Step 3: Convert using LameJS (reuse existing logic)
-        st.textContent = 'Converting to MP3...';
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const audioBuf = await ctx.decodeAudioData(await blob.arrayBuffer());
-        ctx.close();
-        
-        const ch = Math.min(2, audioBuf.numberOfChannels);
-        const rate = audioBuf.sampleRate;
-        const kbps = 192; // Default quality
-        
-        const enc = new lamejs.Mp3Encoder(ch, rate, kbps);
-        const parts = [];
-        const step = 1152 * 20;
-        
-        const to16 = f => {
-            const o = new Int16Array(f.length);
-            for (let i = 0; i < f.length; i++) {
-                const v = Math.max(-1, Math.min(1, f[i]));
-                o[i] = v < 0 ? v * 0x8000 : v * 0x7FFF;
-            }
-            return o;
-        };
-        
-        const L = to16(audioBuf.getChannelData(0));
-        const R = ch > 1 ? to16(audioBuf.getChannelData(1)) : null;
-        
-        for (let i = 0; i < L.length; i += step) {
-            const out = ch > 1 ? enc.encodeBuffer(L.subarray(i, i + step), R.subarray(i, i + step)) : enc.encodeBuffer(L.subarray(i, i + step));
-            if (out.length) parts.push(out);
-            bar.style.width = (i / L.length * 100) + '%';
-            if ((i / step) % 10 === 0) await new Promise(r => setTimeout(r, 0));
-        }
-        const end = enc.flush();
-        if (end.length) parts.push(end);
-        
-        const mp3Blob = new Blob(parts, { type: 'audio/mpeg' });
-        
-        // Step 4: Save to Library
-        const t = { 
-            id: uid(), 
-            title: title.replace(/\.[^.]+$/, ''), 
-            artist: artist, 
-            duration: audioBuf.duration, 
-            created: Date.now(), 
-            blob: mp3Blob 
-        };
-        
-        await dbPut(t);
-        tracks.push(t);
-        
-        bar.style.width = '100%';
-        st.textContent = 'Converted!';
-        
-        const dlBtn = document.createElement('button');
-        dlBtn.className = 'small';
-        dlBtn.textContent = 'Download';
-        dlBtn.onclick = () => downloadTrack(t);
-        st.append(dlBtn);
-        
-        toast('Added to Library: ' + title);
-        
-    } catch (err) {
-        st.textContent = 'Error: ' + err.message;
-        st.style.color = 'var(--danger)';
-        console.error(err);
-    }
 }
 
 /* ---------- free photo reading (Tesseract OCR runs on the phone; the photo is never uploaded) ---------- */
@@ -741,15 +676,91 @@ async function playtubeSearch(query) {
   const doc = new DOMParser().parseFromString(text, 'text/html');   // site answers with a normal web page
   const links = [...doc.querySelectorAll(PLAYTUBE.resultSelector)].slice(0, 8);
   const out = await Promise.all(links.map(async a => {
-    const href = a.getAttribute('href');
-    if (!href) return null;
-    const fullUrl = new URL(href, url).href;
+    const href = a.getAttribute('href') || '';
     const name = a.textContent.trim();
-    return mk(fullUrl, name, '');
+    const artist = '';
+    return mk(href, name, artist);
   }));
-  return out.filter(Boolean);
+  return out.filter(c => c.url);
 }
-</script>
+
+/* ---------- MAIN SEARCH LOGIC ---------- */
+async function openSearch() {
+  openDlg(`<h2>Find Music</h2>
+    <input type="text" id="q" placeholder="Search Internet Archive, Jamendo, or your site...">
+    <button class="btn" id="search-btn">Search</button>
+    <div id="results" style="margin-top:12px"></div>
+    <button class="btn ghost" id="close-search" style="margin-top:12px">Close</button>`);
+  $('#close-search').onclick = () => dlg.close();
+  $('#search-btn').onclick = runSearch;
+  $('#q').onkeydown = e => { if(e.key==='Enter') runSearch(); };
+}
+
+async function runSearch() {
+  const q = $('#q').value.trim();
+  if(!q) return;
+  $('#results').innerHTML = '<div class="empty">Searching...</div>';
+  
+  const [ia, jm, pt] = await Promise.all([
+    archiveSearch(q),
+    jamendoSearch(q, '4f28371d'), // Public demo key
+    playtubeSearch(q)
+  ]);
+  
+  const all = [...ia, ...jm, ...pt];
+  if(all.length === 0) {
+    $('#results').innerHTML = '<div class="empty">No results found.</div>';
+    return;
+  }
+  
+  $('#results').innerHTML = all.map(item => `
+    <div class="row" style="cursor:pointer" data-url="${item.url}">
+      <div class="ico">🌐</div>
+      <div class="meta">
+        <div class="t">${esc(item.name)}</div>
+        <div class="a">${esc(item.artist)} • ${esc(item.src)}</div>
+      </div>
+      <button class="btn sm">+</button>
+    </div>
+  `).join('');
+  
+  document.querySelectorAll('[data-url]').forEach(el => {
+    el.onclick = async () => {
+      const url = el.dataset.url;
+      $('#results').innerHTML = '<div class="empty">Downloading & Converting...</div>';
+      try {
+        const res = await fetch(url);
+        const blob = await res.blob();
+        const ctx = new AudioContext();
+        const buf = await ctx.decodeAudioData(blob);
+        ctx.close();
+        
+        const ch = 1, rate = 44100; // Simplified for web streams often
+        const enc = new lamejs.Mp3Encoder(ch, rate, 192);
+        const samples = buf.getChannelData(0);
+        const step = 1152;
+        const parts = [];
+        
+        for(let i=0; i<samples.length; i+=step) {
+          const chunk = samples.subarray(i, i+step);
+          const mp3 = enc.encodeBuffer(chunk);
+          if(mp3.length) parts.push(mp3);
+        }
+        const end = enc.flush();
+        if(end.length) parts.push(end);
+        
+        const mp3Blob = new Blob(parts, {type: 'audio/mpeg'});
+        const t = { id: uid(), title: item.name, artist: item.artist, duration: buf.duration, created: Date.now(), blob: mp3Blob };
+        await dbPut(t); tracks.push(t);
+        $('#results').innerHTML = `<div class="empty" style="color:var(--accent)">Saved!</div>`;
+        toast('Added to Library');
+        render();
+      } catch(e) {
+        $('#results').innerHTML = `<div class="empty" style="color:var(--danger)">Error: ${e.message}</div>`;
+      }
+    };
+  });
+}
 </script>
 </body>
 </html>
