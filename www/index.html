@@ -89,6 +89,7 @@ input[type=text],input[type=password],select{width:100%;background:var(--panel2)
 <audio id="audio" preload="metadata"></audio>
 
 <script>
+<script>
 /* ---------- tiny helpers ---------- */
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -274,15 +275,15 @@ async function downloadTrack(t) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(t.blob); a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
-const BLOCKED_SITES = /(^|\.)(soundcloud\.com|apple\.com|deezer\.com|tidal\.com|tiktok\.com|instagram\.com|facebook\.com|fb\.watch|twitter\.com|x\.com|vimeo\.com|dailymotion\.com|twitch\.tv|bandcamp\.com|amazon\.[a-z.]+)$/i;
+const BLOCKED_SITES = /(^|\.)(youtube\.com|youtu\.be|spotify\.com|soundcloud\.com|apple\.com|deezer\.com|tidal\.com|tiktok\.com|instagram\.com|facebook\.com|fb\.watch|twitter\.com|x\.com|vimeo\.com|dailymotion\.com|twitch\.tv|bandcamp\.com|amazon\.[a-z.]+)$/i;
 function openConvert(prefill) {
   let pending = [];
   openDlg(`<h2 style="margin-top:0">Convert to MP3</h2>
     <p class="sub">Choose video or audio files you own, a folder, or a direct link to a file. Conversion happens on this device. MP3s are saved to your Library and nothing downloads until you tap Download.</p>
     <label class="drop" for="file">Choose files<input id="file" type="file" accept="audio/*,video/*" multiple hidden></label>
     <label class="drop" for="folder">Choose a folder (convert a whole playlist)<input id="folder" type="file" webkitdirectory multiple hidden></label>
-    <label class="sub">Or paste a link to an audio/video file</label>
-    <div style="display:flex;gap:8px;margin-top:6px"><input type="text" id="lnk" placeholder="https://example.com/clip.mp4" inputmode="url" style="margin:0"><button class="btn sm" id="addlink">Add</button></div>
+    <label class="sub">Or paste a link to an audio/video file (YouTube supported)</label>
+    <div style="display:flex;gap:8px;margin-top:6px"><input type="text" id="lnk" placeholder="https://youtube.com/watch?v=..." inputmode="url" style="margin:0"><button class="btn sm" id="addlink">Add</button></div>
     <div id="lnkmsg" class="sub" style="margin:6px 0 12px"></div>
     <div id="picked" class="sub"></div>
     <label class="sub">Add to playlist</label>
@@ -304,15 +305,51 @@ function openConvert(prefill) {
   $('#addlink').onclick = async () => {
     const msg = $('#lnkmsg'); let u;
     try { u = new URL($('#lnk').value.trim()); if (!/^https?:$/.test(u.protocol)) throw 0; } catch { return msg.textContent = 'That doesn’t look like a web link.'; }
-    if (BLOCKED_SITES.test(u.hostname)) return msg.textContent = 'Links from streaming and video sites can’t be converted here. If it’s your own video, download the original file and use Choose files.';
-    msg.textContent = 'Fetching…';
-    try {
-      const r = await fetch(u); if (!r.ok) throw 0;
-      const ct = r.headers.get('content-type') || '';
-      if (!/^(audio|video)\//.test(ct) && !/octet-stream/.test(ct)) return msg.textContent = 'That link is a web page, not an audio or video file.';
-      const blob = await r.blob(), name = decodeURIComponent(u.pathname.split('/').pop() || '') || 'link-audio';
-      pending.push(new File([blob], name, { type: blob.type })); $('#lnk').value = ''; msg.textContent = 'Added.'; showPicked();
-    } catch { msg.textContent = 'Couldn’t fetch that link. The server may block other apps, or the link needs a login.'; }
+    
+    // Check if it's a YouTube link
+    if (/^.*(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/).*$/i.test(u.href)) {
+        msg.textContent = 'Detected YouTube link. Converting...';
+        const vidId = u.href.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/)?.[1];
+        if (vidId) {
+            try {
+                // Fetch audio stream from Piped API
+                const metaRes = await fetch(`https://pipedapi.kavin.rocks/streams/${vidId}`);
+                const meta = await metaRes.json();
+                const audioStreams = (meta.audioStreams || []).sort((a, b) => b.bitrate - a.bitrate);
+                
+                if (audioStreams.length > 0) {
+                    const audioUrl = audioStreams[0].url;
+                    const response = await fetch(audioUrl);
+                    const blob = await response.blob();
+                    
+                    // Create a fake file object to reuse conversion logic
+                    const fakeFile = new File([blob], `${vidId}.mp3`, { type: 'audio/mpeg' });
+                    pending = [fakeFile];
+                    showPicked();
+                    msg.textContent = 'YouTube audio fetched! Ready to convert.';
+                } else {
+                    msg.textContent = 'Could not find audio stream for this video.';
+                    return;
+                }
+            } catch (e) {
+                msg.textContent = 'Error fetching YouTube stream: ' + e.message;
+                return;
+            }
+        } else {
+            msg.textContent = 'Could not parse YouTube ID.';
+            return;
+        }
+    } else {
+        if (BLOCKED_SITES.test(u.hostname)) return msg.textContent = 'Links from streaming and video sites can’t be converted here. If it’s your own video, download the original file and use Choose files.';
+        msg.textContent = 'Fetching…';
+        try {
+            const r = await fetch(u); if (!r.ok) throw 0;
+            const ct = r.headers.get('content-type') || '';
+            if (!/^(audio|video)\//.test(ct) && !/octet-stream/.test(ct)) return msg.textContent = 'That link is a web page, not an audio or video file.';
+            const blob = await r.blob(), name = decodeURIComponent(u.pathname.split('/').pop() || '') || 'link-audio';
+            pending.push(new File([blob], name, { type: blob.type })); $('#lnk').value = ''; msg.textContent = 'Added.'; showPicked();
+        } catch { msg.textContent = 'Couldn’t fetch that link. The server may block other apps, or the link needs a login.'; }
+    }
   };
   $('#go').onclick = async () => {
     $('#go').disabled = true; const ids = [], kbps = +$('#kbps').value, target = $('#pl').value;
@@ -354,134 +391,9 @@ async function convertFile(file, kbps) {
   } catch (err) { st.textContent = 'Could not convert this file (unsupported format or too large for this device).'; st.style.color = 'var(--danger)'; return null; }
 }
 
-/* ---------- free photo reading (Tesseract OCR runs on the phone; the photo is never uploaded) ---------- */
-let tessLoading = null;
-const loadTesseract = () => window.Tesseract ? Promise.resolve() : (tessLoading = tessLoading || new Promise((res, rej) => {
-  const sc = document.createElement('script'); sc.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js'; sc.onload = res; sc.onerror = () => rej(new Error('load')); document.head.append(sc); }));
-const cleanLine = l => l.replace(/\b\d{1,2}:\d{2}\b/g, ' ').replace(/^[\s\d.)\-–•*]+/, '').replace(/[^\p{L}\p{N}&'’\- ]+/gu, ' ').replace(/\s+/g, ' ').trim();
-async function readPhoto(file, out, onPick) {
-  out.innerHTML = '<p class="sub">Loading the text reader (needs internet the first time)…</p>';
-  try {
-    await loadTesseract();
-    const img = await toDataUrl(file, 1800, .92);
-    const worker = await Tesseract.createWorker('eng', 1, { logger: m => { if (m.status === 'recognizing text') out.innerHTML = `<p class="sub">Reading the photo… ${Math.round(m.progress * 100)}%</p>`; } });
-    const { data } = await worker.recognize(img); await worker.terminate();
-    const lines = [...new Set(data.text.split('\n').map(cleanLine).filter(l => (l.match(/\p{L}/gu) || []).length >= 3))].slice(0, 40);
-    if (!lines.length) { out.innerHTML = '<p class="sub">I couldn’t read any text. Try a clearer, closer photo.</p>'; return; }
-    out.innerHTML = '<p class="sub">Tap a line to search for it. If something was misread, fix it in the search box above.</p>' + lines.map((l, k) => `<button class="row" style="width:100%;text-align:left" data-l="${k}"><div class="meta t">${esc(l)}</div><span class="small">Search</span></button>`).join('');
-    out.querySelectorAll('[data-l]').forEach(b => b.onclick = () => onPick(lines[+b.dataset.l]));
-  } catch { out.innerHTML = '<p class="sub" style="color:var(--danger)">Couldn’t read that photo. The text reader needs an internet connection the first time.</p>'; }
-}
-
-/* ---------- CUSTOMIZE ---------- */
-const THEMES = {
-  Violet: { accent: '#7C6CFF', bg: '#12161D', panel: '#1B212B', ink: '#EEF1F6', amber: '#FFB547' },
-  Ocean: { accent: '#2FB8D6', bg: '#0B1A24', panel: '#12293A', ink: '#E8F4F8', amber: '#FFD27A' },
-  Rose: { accent: '#F0638B', bg: '#1C1218', panel: '#2A1A24', ink: '#FBEFF3', amber: '#FFB98A' },
-  Forest: { accent: '#5BBF8A', bg: '#0F1A14', panel: '#172A20', ink: '#EAF5EE', amber: '#E8C26A' },
-  Paper: { accent: '#5B4BE0', bg: '#F4F1EA', panel: '#FFFFFF', ink: '#1D1B26', amber: '#C77700' }
-};
-const DEFAULT_THEME = { ...THEMES.Violet, radius: 14, zoom: 100, font: '', dim: 35, blur: 0, cardOpacity: 100, density: 10, wall: '', css: '', hide: [] };
-let theme = { ...DEFAULT_THEME, ...ls('theme', {}) };
-const isLight = hex => { const n = parseInt(hex.slice(1), 16); return (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) > 150; };
-function applyTheme() {
-  const r = document.documentElement.style, t = theme;
-  r.setProperty('--accent', t.accent); r.setProperty('--bg', t.bg); r.setProperty('--ink', t.ink); r.setProperty('--amber', t.amber);
-  r.setProperty('--panel', `color-mix(in srgb, ${t.panel} ${t.cardOpacity}%, transparent)`);
-  r.setProperty('--panel2', `color-mix(in srgb, ${t.panel} 85%, ${t.ink})`);
-  r.setProperty('--mute', `color-mix(in srgb, ${t.ink} 55%, ${t.bg})`);
-  r.setProperty('--r', t.radius + 'px'); r.setProperty('--pad', t.density + 'px');
-  r.fontFamily = t.font || ''; r.colorScheme = isLight(t.bg) ? 'light' : 'dark';
-  document.body.style.zoom = t.zoom / 100;
-  const w = $('#wall');
-  w.style.backgroundImage = t.wall ? `linear-gradient(rgba(0,0,0,${t.dim / 100}),rgba(0,0,0,${t.dim / 100})), url(${t.wall})` : 'none';
-  w.style.filter = t.blur ? `blur(${t.blur}px)` : 'none'; w.style.transform = t.blur ? 'scale(1.06)' : 'none';
-  $('#usercss').textContent = t.css;
-  document.querySelector('meta[name=theme-color]').content = t.bg;
-}
-function commitTheme() { try { save('theme', theme); } catch { toast('Not enough space to save that'); } applyTheme(); }
-async function toDataUrl(file, max, q) {
-  const bmp = await createImageBitmap(file), s = Math.min(1, max / Math.max(bmp.width, bmp.height));
-  const c = document.createElement('canvas'); c.width = bmp.width * s; c.height = bmp.height * s;
-  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height); return c.toDataURL('image/jpeg', q);
-}
-function openCustomize() {
-  const t = theme;
-  const sl = (id, label, min, max, val) => `<label class="sub">${label}: <b id="${id}-v">${val}</b></label><input type="range" id="${id}" min="${min}" max="${max}" value="${val}" style="width:100%;accent-color:var(--accent);margin:6px 0 12px">`;
-  const col = (id, label, val) => `<label class="sub" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">${label}<input type="color" id="${id}" value="${val}"></label>`;
-  openDlg(`<h2 style="margin-top:0">Customize</h2>
-    <div class="links" style="margin:0 0 14px">${Object.keys(THEMES).map(n => `<button class="small" data-th="${n}">${n}</button>`).join('')}</div>
-    ${col('c-accent', 'Accent', t.accent)}${col('c-bg', 'Background', t.bg)}${col('c-panel', 'Cards', t.panel)}${col('c-ink', 'Text', t.ink)}${col('c-amber', 'Highlight', t.amber)}
-    ${sl('s-radius', 'Corner roundness', 0, 28, t.radius)}${sl('s-zoom', 'Interface size %', 80, 130, t.zoom)}${sl('s-density', 'Row spacing', 4, 18, t.density)}${sl('s-card', 'Card opacity %', 20, 100, t.cardOpacity)}
-    <label class="sub">Font</label>
-    <select id="f-font"><option value="">Space Grotesk</option><option value="system-ui,sans-serif">System</option><option value="Georgia,serif">Serif</option><option value="ui-monospace,Menlo,monospace">Monospace</option></select>
-    <h2>Wallpaper</h2>
-    <label class="drop" for="wp" style="margin-top:0">Choose a wallpaper from your photos<input id="wp" type="file" accept="image/*" hidden></label>
-    ${sl('s-dim', 'Wallpaper darkness %', 0, 80, t.dim)}${sl('s-blur', 'Wallpaper blur', 0, 20, t.blur)}
-    <button class="small" id="wp-clear">Remove wallpaper</button>
-    <h2>Home sections</h2>
-    ${[['wrap', 'Daily wrap'], ['last', 'Last listened'], ['most', 'Most listened']].map(([k, n]) => `<label class="sub" style="display:flex;gap:8px;margin-bottom:6px"><input type="checkbox" data-sec="${k}" ${t.hide.includes(k) ? '' : 'checked'}> ${n}</label>`).join('')}
-    <h2>Advanced: your own CSS</h2>
-    <textarea id="u-css" rows="5" placeholder=".wrap{border-radius:0}" style="width:100%;background:var(--panel2);color:var(--ink);border:1px solid #2f3949;border-radius:10px;padding:10px;font-family:ui-monospace,monospace">${esc(t.css)}</textarea>
-    <div style="display:flex;gap:8px;margin-top:14px"><button class="btn" id="th-done">Done</button><button class="btn ghost" id="th-reset">Reset all</button></div>`);
-  document.querySelectorAll('[data-th]').forEach(b => b.onclick = () => { theme = { ...theme, ...THEMES[b.dataset.th] }; commitTheme(); openCustomize(); });
-  [['c-accent', 'accent'], ['c-bg', 'bg'], ['c-panel', 'panel'], ['c-ink', 'ink'], ['c-amber', 'amber']].forEach(([id, k]) => $('#' + id).oninput = e => { theme[k] = e.target.value; commitTheme(); });
-  [['s-radius', 'radius'], ['s-zoom', 'zoom'], ['s-density', 'density'], ['s-card', 'cardOpacity'], ['s-dim', 'dim'], ['s-blur', 'blur']].forEach(([id, k]) => $('#' + id).oninput = e => { theme[k] = +e.target.value; $('#' + id + '-v').textContent = e.target.value; commitTheme(); });
-  $('#f-font').value = t.font; $('#f-font').onchange = e => { theme.font = e.target.value; commitTheme(); };
-  $('#wp').onchange = async e => { const f = e.target.files[0]; if (!f) return; try { theme.wall = await toDataUrl(f, 1600, .8); commitTheme(); toast('Wallpaper set'); } catch { toast('Couldn’t use that image'); } };
-  $('#wp-clear').onclick = () => { theme.wall = ''; commitTheme(); };
-  document.querySelectorAll('[data-sec]').forEach(c => c.onchange = () => { theme.hide = [...document.querySelectorAll('[data-sec]')].filter(x => !x.checked).map(x => x.dataset.sec); commitTheme(); });
-  $('#u-css').oninput = e => { theme.css = e.target.value; commitTheme(); };
-  $('#th-reset').onclick = () => { theme = { ...DEFAULT_THEME }; commitTheme(); openCustomize(); };
-  $('#th-done').onclick = () => { dlg.close(); render(); };
-}
-
-/* ---------- links shared to the app ---------- */
-function incomingLink() {
-  const p = new URLSearchParams(location.search), m = (p.get('url') || p.get('text') || '').match(/https?:\/\/\S+/);
-  if (m) history.replaceState(null, '', location.pathname); return m && m[0];
-}
-
-/* ---------- free & legal music search (Internet Archive + optional Jamendo) ---------- */
-async function jget(url) { const r = await fetch(url); if (!r.ok) throw new Error(r.status); return r.json(); }
-async function archiveSearch(query) {
-  const terms = query.replace(/[^\p{L}\p{N} ]+/gu, ' ').split(/\s+/).filter(Boolean).slice(0, 6);
-  if (!terms.length) return [];
-  const ask = async join => (await jget('https://archive.org/advancedsearch.php?q=' + encodeURIComponent('(' + terms.join(join) + ') AND mediatype:audio') + '&fl[]=identifier&fl[]=title&fl[]=creator&rows=10&output=json')).response?.docs || [];
-  let docs = await ask(' AND ');
-  if (!docs.length) docs = await ask(' OR ');
-  const lists = await Promise.all(docs.map(async doc => {
-    try {
-      const m = await jget('https://archive.org/metadata/' + encodeURIComponent(doc.identifier));
-      const lic = m.metadata?.licenseurl || '';
-      if (!/creativecommons\.org|publicdomain/i.test(lic)) return [];   // only openly licensed / public-domain items
-      const creator = [].concat(doc.creator || []).join(', ');
-      return (m.files || []).filter(f => /\.mp3$/i.test(f.name) && /mp3/i.test(f.format || '')).slice(0, 3).map(f => ({
-        src: 'Internet Archive', license: lic, name: f.title || f.name.replace(/\.mp3$/i, ''), artist: f.creator || creator,
-        url: 'https://archive.org/download/' + encodeURIComponent(doc.identifier) + '/' + f.name.split('/').map(encodeURIComponent).join('/') }));
-    } catch { return []; }
-  }));
-  return lists.flat();
-}
-async function jamendoSearch(query, cid) {
-  const d = await jget('https://api.jamendo.com/v3.0/tracks/?client_id=' + encodeURIComponent(cid) + '&format=json&limit=8&audiodownload_allowed=true&search=' + encodeURIComponent(query));
-  return (d.results || []).filter(r => r.audiodownload).map(r => ({ src: 'Jamendo', license: r.license_ccurl || 'Creative Commons', url: r.audiodownload, name: r.name, artist: r.artist_name }));
-}
-async function addFree(c, it, btn) {
-  btn.disabled = true; btn.textContent = 'Fetching…';
-  try {
-    const r = await fetch(c.url); if (!r.ok) throw 0;
-    if (/zip|html|json/i.test(r.headers.get('content-type') || '')) throw 0;
-    const raw = await r.blob(); if (raw.size < 20000) throw 0;
-    const blob = new Blob([raw], { type: 'audio/mpeg' });
-    const dur = await new Promise(res => { const a = new Audio(); a.preload = 'metadata'; a.onloadedmetadata = () => res(a.duration); a.onerror = () => res(0); a.src = URL.createObjectURL(blob); });
-    const t = { id: uid(), title: c.name || it.title, artist: c.artist || it.artist || '', duration: dur || 0, created: Date.now(), blob };
-    await dbPut(t); tracks.push(t); toast('Added to Library');
-    btn.disabled = false; btn.textContent = 'Download MP3'; btn.onclick = () => downloadTrack(t);
-  } catch { btn.disabled = false; btn.textContent = 'Couldn’t fetch it, try again'; }
-}
+/* ---------- AI SEARCH (YouTube, Spotify, Archive) ---------- */
 async function openSearch() {
-    let currentMode = 'archive'; // default
+    let currentMode = 'archive';
     
     openDlg(`
         <h2 style="margin-top:0">Find Music</h2>
@@ -503,7 +415,6 @@ async function openSearch() {
         $('#results').innerHTML = '';
     };
     
-    // Initialize first tab
     setSearchMode('archive');
 
     $('#search-btn').onclick = () => {
@@ -525,7 +436,7 @@ function showResults(items) {
     }
     
     container.innerHTML = items.map(item => `
-        <div class="row" style="cursor:pointer" onclick='convertUrl("${item.url}", "${esc(item.title)}", "${esc(item.artist || 'Unknown')}")'>
+        <div class="row" style="cursor:pointer" onclick='convertUrl("${item.url}", "${esc(item.name)}", "${esc(item.artist || 'Unknown')}")'>
             <div class="ico">${item.src === 'YouTube' ? '▶' : item.src === 'Spotify' ? '♫' : '📀'}</div>
             <div class="meta">
                 <div class="t">${esc(item.name)}</div>
@@ -535,6 +446,8 @@ function showResults(items) {
         </div>
     `).join('');
 }
+
+// --- YOUTUBE LOGIC (Using Piped API - No Key Needed) ---
 async function ytSearch(query) {
     try {
         const res = await fetch(`https://pipedapi.kavin.rocks/search?q=${encodeURIComponent(query)}&filter=videos`);
@@ -581,7 +494,7 @@ async function spSearch(query) {
     }
 }
 
-// --- CONVERSION HELPER ---
+// --- CONVERSION HELPER FOR SEARCH RESULTS ---
 async function convertUrl(url, title, artist) {
     dlg.close();
     
@@ -698,6 +611,145 @@ async function convertUrl(url, title, artist) {
         console.error(err);
     }
 }
+
+/* ---------- free photo reading (Tesseract OCR runs on the phone; the photo is never uploaded) ---------- */
+let tessLoading = null;
+const loadTesseract = () => window.Tesseract ? Promise.resolve() : (tessLoading = tessLoading || new Promise((res, rej) => {
+  const sc = document.createElement('script'); sc.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js'; sc.onload = res; sc.onerror = () => rej(new Error('load')); document.head.append(sc); }));
+const cleanLine = l => l.replace(/\b\d{1,2}:\d{2}\b/g, ' ').replace(/^[\s\d.)\-–•*]+/, '').replace(/[^\p{L}\p{N}&'’\- ]+/gu, ' ').replace(/\s+/g, ' ').trim();
+async function readPhoto(file, out, onPick) {
+  out.innerHTML = '<p class="sub">Loading the text reader (needs internet the first time)…</p>';
+  try {
+    await loadTesseract();
+    const img = await toDataUrl(file, 1800, .92);
+    const worker = await Tesseract.createWorker('eng', 1, { logger: m => { if (m.status === 'recognizing text') out.innerHTML = `<p class="sub">Reading the photo… ${Math.round(m.progress * 100)}%</p>`; } });
+    const { data } = await worker.recognize(img); await worker.terminate();
+    const lines = [...new Set(data.text.split('\n').map(cleanLine).filter(l => (l.match(/\p{L}/gu) || []).length >= 3))].slice(0, 40);
+    if (!lines.length) { out.innerHTML = '<p class="sub">I couldn’t read any text. Try a clearer, closer photo.</p>'; return; }
+    out.innerHTML = '<p class="sub">Tap a line to search for it. If something was misread, fix it in the search box above.</p>' + lines.map((l, k) => `<button class="row" style="width:100%;text-align:left" data-l="${k}"><div class="meta t">${esc(l)}</div><span class="small">Search</span></button>`).join('');
+    out.querySelectorAll('[data-l]').forEach(b => b.onclick = () => onPick(lines[+b.dataset.l]));
+  } catch { out.innerHTML = '<p class="sub" style="color:var(--danger)">Couldn’t read that photo. The text reader needs an internet connection the first time.</p>'; }
+}
+
+/* ---------- CUSTOMIZE ---------- */
+const THEMES = {
+  Violet: { accent: '#7C6CFF', bg: '#12161D', panel: '#1B212B', ink: '#EEF1F6', amber: '#FFB547' },
+  Ocean: { accent: '#2FB8D6', bg: '#0B1A24', panel: '#12293A', ink: '#E8F4F8', amber: '#FFD27A' },
+  Rose: { accent: '#F0638B', bg: '#1C1218', panel: '#2A1A24', ink: '#FBEFF3', amber: '#FFB98A' },
+  Forest: { accent: '#5BBF8A', bg: '#0F1A14', panel: '#172A20', ink: '#EAF5EE', amber: '#E8C26A' },
+  Paper: { accent: '#5B4BE0', bg: '#F4F1EA', panel: '#FFFFFF', ink: '#1D1B26', amber: '#C77700' }
+};
+const DEFAULT_THEME = { ...THEMES.Violet, radius: 14, zoom: 100, font: '', dim: 35, blur: 0, cardOpacity: 100, density: 10, wall: '', css: '', hide: [] };
+let theme = { ...DEFAULT_THEME, ...ls('theme', {}) };
+const isLight = hex => { const n = parseInt(hex.slice(1), 16); return (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) > 150; };
+function applyTheme() {
+  const r = document.documentElement.style, t = theme;
+  r.setProperty('--accent', t.accent); r.setProperty('--bg', t.bg); r.setProperty('--ink', t.ink); r.setProperty('--amber', t.amber);
+  r.setProperty('--panel', `color-mix(in srgb, ${t.panel} ${t.cardOpacity}%, transparent)`);
+  r.setProperty('--panel2', `color-mix(in srgb, ${t.panel} 85%, ${t.ink})`);
+  r.setProperty('--mute', `color-mix(in srgb, ${t.ink} 55%, ${t.bg})`);
+  r.setProperty('--r', t.radius + 'px'); r.setProperty('--pad', t.density + 'px');
+  r.fontFamily = t.font || ''; r.colorScheme = isLight(t.bg) ? 'light' : 'dark';
+  document.body.style.zoom = t.zoom / 100;
+  const w = $('#wall');
+  w.style.backgroundImage = t.wall ? `linear-gradient(rgba(0,0,0,${t.dim / 100}),rgba(0,0,0,${t.dim / 100})), url(${t.wall})` : 'none';
+  w.style.filter = t.blur ? `blur(${t.blur}px)` : 'none'; w.style.transform = t.blur ? 'scale(1.06)' : 'none';
+  $('#usercss').textContent = t.css;
+  document.querySelector('meta[name=theme-color]').content = t.bg;
+}
+function commitTheme() { try { save('theme', theme); } catch { toast('Not enough space to save that'); } applyTheme(); }
+async function toDataUrl(file, max, q) {
+  const bmp = await createImageBitmap(file), s = Math.min(1, max / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas'); c.width = bmp.width * s; c.height = bmp.height * s;
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height); return c.toDataURL('image/jpeg', q);
+}
+function openCustomize() {
+  const t = theme;
+  const sl = (id, label, min, max, val) => `<label class="sub">${label}: <b id="${id}-v">${val}</b></label><input type="range" id="${id}" min="${min}" max="${max}" value="${val}" style="width:100%;accent-color:var(--accent);margin:6px 0 12px">`;
+  const col = (id, label, val) => `<label class="sub" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">${label}<input type="color" id="${id}" value="${val}"></label>`;
+  openDlg(`<h2 style="margin-top:0">Customize</h2>
+    <div class="links" style="margin:0 0 14px">${Object.keys(THEMES).map(n => `<button class="small" data-th="${n}">${n}</button>`).join('')}</div>
+    ${col('c-accent', 'Accent', t.accent)}${col('c-bg', 'Background', t.bg)}${col('c-panel', 'Cards', t.panel)}${col('c-ink', 'Text', t.ink)}${col('c-amber', 'Highlight', t.amber)}
+    ${sl('s-radius', 'Corner roundness', 0, 28, t.radius)}${sl('s-zoom', 'Interface size %', 80, 130, t.zoom)}${sl('s-density', 'Row spacing', 4, 18, t.density)}${sl('s-card', 'Card opacity %', 20, 100, t.cardOpacity)}
+    <label class="sub">Font</label>
+    <select id="f-font"><option value="">Space Grotesk</option><option value="system-ui,sans-serif">System</option><option value="Georgia,serif">Serif</option><option value="ui-monospace,Menlo,monospace">Monospace</option></select>
+    <h2>Wallpaper</h2>
+    <label class="drop" for="wp" style="margin-top:0">Choose a wallpaper from your photos<input id="wp" type="file" accept="image/*" hidden></label>
+    ${sl('s-dim', 'Wallpaper darkness %', 0, 80, t.dim)}${sl('s-blur', 'Wallpaper blur', 0, 20, t.blur)}
+    <button class="small" id="wp-clear">Remove wallpaper</button>
+    <h2>Home sections</h2>
+    ${[['wrap', 'Daily wrap'], ['last', 'Last listened'], ['most', 'Most listened']].map(([k, n]) => `<label class="sub" style="display:flex;gap:8px;margin-bottom:6px"><input type="checkbox" data-sec="${k}" ${t.hide.includes(k) ? '' : 'checked'}> ${n}</label>`).join('')}
+    <h2>Advanced: your own CSS</h2>
+    <textarea id="u-css" rows="5" placeholder=".wrap{border-radius:0}" style="width:100%;background:var(--panel2);color:var(--ink);border:1px solid #2f3949;border-radius:10px;padding:10px;font-family:ui-monospace,monospace">${esc(t.css)}</textarea>
+    <div style="display:flex;gap:8px;margin-top:14px"><button class="btn" id="th-done">Done</button><button class="btn ghost" id="th-reset">Reset all</button></div>`);
+  document.querySelectorAll('[data-th]').forEach(b => b.onclick = () => { theme = { ...theme, ...THEMES[b.dataset.th] }; commitTheme(); openCustomize(); });
+  [['c-accent', 'accent'], ['c-bg', 'bg'], ['c-panel', 'panel'], ['c-ink', 'ink'], ['c-amber', 'amber']].forEach(([id, k]) => $('#' + id).oninput = e => { theme[k] = e.target.value; commitTheme(); });
+  [['s-radius', 'radius'], ['s-zoom', 'zoom'], ['s-density', 'density'], ['s-card', 'cardOpacity'], ['s-dim', 'dim'], ['s-blur', 'blur']].forEach(([id, k]) => $('#' + id).oninput = e => { theme[k] = +e.target.value; $('#' + id + '-v').textContent = e.target.value; commitTheme(); });
+  $('#f-font').value = t.font; $('#f-font').onchange = e => { theme.font = e.target.value; commitTheme(); };
+  $('#wp').onchange = async e => { const f = e.target.files[0]; if (!f) return; try { theme.wall = await toDataUrl(f, 1600, .8); commitTheme(); toast('Wallpaper set'); } catch { toast('Couldn’t use that image'); } };
+  $('#wp-clear').onclick = () => { theme.wall = ''; commitTheme(); };
+  document.querySelectorAll('[data-sec]').forEach(c => c.onchange = () => { theme.hide = [...document.querySelectorAll('[data-sec]')].filter(x => !x.checked).map(x => x.dataset.sec); commitTheme(); });
+  $('#u-css').oninput = e => { theme.css = e.target.value; commitTheme(); };
+  $('#th-reset').onclick = () => { theme = { ...DEFAULT_THEME }; commitTheme(); openCustomize(); };
+  $('#th-done').onclick = () => { dlg.close(); render(); };
+}
+
+/* ---------- links shared to the app ---------- */
+function incomingLink() {
+  const p = new URLSearchParams(location.search), m = (p.get('url') || p.get('text') || '').match(/https?:\/\/\S+/);
+  if (m) history.replaceState(null, '', location.pathname); return m && m[0];
+}
+
+/* ---------- free & legal music search (Internet Archive + optional Jamendo) ---------- */
+async function jget(url) { const r = await fetch(url); if (!r.ok) throw new Error(r.status); return r.json(); }
+async function archiveSearch(query) {
+  const terms = query.replace(/[^\p{L}\p{N} ]+/gu, ' ').split(/\s+/).filter(Boolean).slice(0, 6);
+  if (!terms.length) return [];
+  const ask = async join => (await jget('https://archive.org/advancedsearch.php?q=' + encodeURIComponent('(' + terms.join(join) + ') AND mediatype:audio') + '&fl[]=identifier&fl[]=title&fl[]=creator&rows=10&output=json')).response?.docs || [];
+  let docs = await ask(' AND ');
+  if (!docs.length) docs = await ask(' OR ');
+  const lists = await Promise.all(docs.map(async doc => {
+    try {
+      const m = await jget('https://archive.org/metadata/' + encodeURIComponent(doc.identifier));
+      const lic = m.metadata?.licenseurl || '';
+      if (!/creativecommons\.org|publicdomain/i.test(lic)) return [];   // only openly licensed / public-domain items
+      const creator = [].concat(doc.creator || []).join(', ');
+      return (m.files || []).filter(f => /\.mp3$/i.test(f.name) && /mp3/i.test(f.format || '')).slice(0, 3).map(f => ({
+        src: 'Internet Archive', license: lic, name: f.title || f.name.replace(/\.mp3$/i, ''), artist: f.creator || creator,
+        url: 'https://archive.org/download/' + encodeURIComponent(doc.identifier) + '/' + f.name.split('/').map(encodeURIComponent).join('/') }));
+    } catch { return []; }
+  }));
+  return lists.flat();
+}
+async function jamendoSearch(query, cid) {
+  const d = await jget('https://api.jamendo.com/v3.0/tracks/?client_id=' + encodeURIComponent(cid) + '&format=json&limit=8&audiodownload_allowed=true&search=' + encodeURIComponent(query));
+  return (d.results || []).filter(r => r.audiodownload).map(r => ({ src: 'Jamendo', license: r.license_ccurl || 'Creative Commons', url: r.audiodownload, name: r.name, artist: r.artist_name }));
+}
+/* ---------- PLAYTUBE: your own website (edit the two lines in the box) ---------- */
+const PLAYTUBE = {
+  searchUrl: 'https://playtube.example.com/search?q={q}',   // 1) CHANGE: your site's search address. {q} becomes what you typed
+  resultSelector: 'a.result'                                // 2) CHANGE: CSS selector of the result links on that page (ignored if your site returns JSON)
+};
+async function playtubeSearch(query) {
+  const url = PLAYTUBE.searchUrl.replace('{q}', encodeURIComponent(query));
+  const res = await fetch(url); if (!res.ok) throw new Error(res.status);
+  const text = await res.text(), mk = (u, name, artist) => ({ src: 'Playtube', license: 'My own site', url: u, name: name || 'Untitled', artist: artist || '' });
+  if (/^\s*[\[{]/.test(text)) {                              // site answers with JSON
+    let d = JSON.parse(text); d = Array.isArray(d) ? d : (d.results || d.items || []);
+    return d.slice(0, 10).map(x => mk(x.url || x.audio || x.video, x.title || x.name, x.artist)).filter(c => c.url);
+  }
+  const doc = new DOMParser().parseFromString(text, 'text/html');   // site answers with a normal web page
+  const links = [...doc.querySelectorAll(PLAYTUBE.resultSelector)].slice(0, 8);
+  const out = await Promise.all(links.map(async a => {
+    const href = a.getAttribute('href');
+    if (!href) return null;
+    const fullUrl = new URL(href, url).href;
+    const name = a.textContent.trim();
+    return mk(fullUrl, name, '');
+  }));
+  return out.filter(Boolean);
+}
+</script>
 </script>
 </body>
 </html>
