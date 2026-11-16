@@ -89,6 +89,7 @@ input[type=text],input[type=password],select{width:100%;background:var(--panel2)
 <audio id="audio" preload="metadata"></audio>
 
 <script>
+<script>
 /* ---------- tiny helpers ---------- */
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -274,10 +275,24 @@ async function downloadTrack(t) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(t.blob); a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
-const BLOCKED_SITES = /(^|\.)(youtube\.com|youtu\.be|spotify\.com|soundcloud\.com|apple\.com|deezer\.com|tidal\.com|tiktok\.com|instagram\.com|facebook\.com|fb\.watch|twitter\.com|x\.com|vimeo\.com|dailymotion\.com|twitch\.tv|bandcamp\.com|amazon\.[a-z.]+)$/i;
 
-/* --- NEW: YouTube & Spotify Search Logic --- */
+// --- YOUTUBE & SPOTIFY LOGIC ---
 const PIPED_API = 'https://pipedapi.kavin.rocks';
+
+async function fetchYoutubeAudio(videoId) {
+  try {
+    const res = await fetch(`${PIPED_API}/streams/${videoId}`);
+    const data = await res.json();
+    if (data.audioStreams && data.audioStreams.length > 0) {
+      const streamUrl = data.audioStreams[0].url;
+      const resp = await fetch(streamUrl);
+      return await resp.blob();
+    }
+    throw new Error("No audio stream found");
+  } catch (e) {
+    throw new Error("Failed to fetch YouTube audio: " + e.message);
+  }
+}
 
 async function ytSearch(query) {
   try {
@@ -295,11 +310,10 @@ async function ytSearch(query) {
 
 async function spSearch(query) {
   try {
-    // Use Jamendo as a proxy for Spotify metadata since we don't have keys
     const res = await fetch(`https://api.jamendo.com/v3.0/tracks/?client_id=4f28371d&format=json&limit=5&search=${encodeURIComponent(query)}`);
     const data = await res.json();
     return (data.results || []).map(t => ({
-      id: null, // We'll search YT with the name
+      id: null,
       title: t.name,
       artist: t.artist_name,
       duration: t.duration,
@@ -326,7 +340,6 @@ async function doSearch() {
   if(!q) return;
   $('#results').innerHTML = '<div class="empty">Searching...</div>';
   
-  // Search both sources
   const [ytRes, spRes] = await Promise.all([ytSearch(q), spSearch(q)]);
   
   const items = [
@@ -365,10 +378,7 @@ async function doSearch() {
         if(source === 'YouTube') {
           mp3Blob = await fetchYoutubeAudio(id);
         } else {
-          // For Spotify, we actually just fetched metadata. 
-          // Since we can't easily stream Spotify without auth, let's fallback to searching YT for the same song
-          // Or just use the YouTube result if available.
-          // Better approach: Re-search YT with the query to get the best match
+          // For Spotify, we fallback to searching YT for the same song
           const ytResults = await ytSearch(title + ' ' + artist);
           if(ytResults.length > 0) {
             mp3Blob = await fetchYoutubeAudio(ytResults[0].id);
@@ -394,20 +404,8 @@ async function doSearch() {
   });
 }
 
-async function fetchYoutubeAudio(videoId) {
-  // Fetch audio stream from Piped API
-  const res = await fetch(`${PIPED_API}/stream/${videoId}`);
-  const data = await res.json();
-  if(data.audioStreams && data.audioStreams.length > 0) {
-    const url = data.audioStreams[0].url;
-    const resp = await fetch(url);
-    return await resp.blob();
-  }
-  throw new Error("No audio stream found");
-}
 
-
-/* ---------- OLD CONVERT FUNCTION (Modified to support URL input) ---------- */
+/* ---------- CONVERT FUNCTION (FIXED) ---------- */
 function openConvert(prefill) {
   let pending = [];
   openDlg(`<h2 style="margin-top:0">Convert to MP3</h2>
@@ -490,7 +488,9 @@ function openConvert(prefill) {
      // Generic link handling
      let u;
      try { u = new URL(urlStr); if (!/^https?:$/.test(u.protocol)) throw 0; } catch { return $('#lnkmsg').textContent = 'That doesn’t look like a web link.'; }
-     if (BLOCKED_SITES.test(u.hostname)) return $('#lnkmsg').textContent = 'Links from streaming and video sites can’t be converted here directly. If it’s your own video, download the original file and use Choose files.';
+     
+     // REMOVED THE BLOCKED_SITES CHECK THAT WAS CAUSING ISSUES
+     // We now try to fetch it regardless. If it fails, it fails.
      
      try {
        const r = await fetch(u); if (!r.ok) throw 0;
@@ -761,6 +761,7 @@ async function runSearch() {
     };
   });
 }
+</script>
 </script>
 </body>
 </html>
